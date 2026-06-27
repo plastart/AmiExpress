@@ -374,6 +374,8 @@ DEF lastIAC=FALSE
 DEF lastIAC2=FALSE
 DEF iaccmd=0
 DEF nawsMode=0
+DEF nawsRows=0      ->last terminal HEIGHT reported via telnet NAWS (0=none yet)
+DEF nawsCols=0      ->last terminal WIDTH reported via telnet NAWS (0=none yet)
 DEF willsent=FALSE
 DEF dosent=FALSE
 
@@ -1020,7 +1022,38 @@ PROC checkUserPassword(user:PTR TO user, userMisc:PTR TO userMisc, testpass:PTR 
   ELSE
     userMisc.invalidAttempts:=0
   ENDIF
-  
+
+ENDPROC res
+
+/* Verify a password WITHOUT any side effects (no invalidAttempts counter,
+** no account lock).  Mirrors checkUserPassword's comparison only, so doors
+** can confirm the current password (e.g. before a self-service change)
+** without risking a lockout on a typo.  Returns TRUE/FALSE. */
+PROC verifyPasswordNoLock(user:PTR TO user, userMisc:PTR TO userMisc, testpass:PTR TO CHAR)
+  DEF tmpHash[32]:ARRAY OF CHAR
+  DEF tempPass[100]:STRING
+  DEF res=FALSE
+  SELECT userMisc.pwdType
+    CASE PWD_LEGACY
+      StrCopy(tempPass,testpass)
+      UpperStr(tempPass)
+      res:=(user.pwdHash=calcPasswordHash(tempPass))
+    CASE PWD_PBKDF2_5
+      pkcs5_pbkdf2(testpass,StrLen(testpass), userMisc.salt,8, tmpHash, 32, 5)
+      res:=(StrCmp(tmpHash,userMisc.pwdHash,32))
+    CASE PWD_PBKDF2_50
+      pkcs5_pbkdf2(testpass,StrLen(testpass), userMisc.salt,8, tmpHash, 32, 50)
+      res:=(StrCmp(tmpHash,userMisc.pwdHash,32))
+    CASE PWD_PBKDF2_100
+      pkcs5_pbkdf2(testpass,StrLen(testpass), userMisc.salt,8, tmpHash, 32, 100)
+      res:=(StrCmp(tmpHash,userMisc.pwdHash,32))
+    CASE PWD_PBKDF2_1000
+      pkcs5_pbkdf2(testpass,StrLen(testpass), userMisc.salt,8, tmpHash, 32, 1000)
+      res:=(StrCmp(tmpHash,userMisc.pwdHash,32))
+    CASE PWD_PBKDF2_10000
+      pkcs5_pbkdf2(testpass,StrLen(testpass), userMisc.salt,8, tmpHash, 32, 10000)
+      res:=(StrCmp(tmpHash,userMisc.pwdHash,32))
+  ENDSELECT
 ENDPROC res
 
 
@@ -1166,7 +1199,8 @@ PROC checkDoorMsg(mode)
         IF(servermsg.data)
           AstrCopy(servermsg.string,loggedOnUser.name,31)
         ELSE
-          AstrCopy(loggedOnUser.name,servermsg.string,31)
+          /* Never let a door blank the user name (see processXimMsg). */
+          IF StrLen(servermsg.string)>0 THEN AstrCopy(loggedOnUser.name,servermsg.string,31)
         ENDIF
       CASE  DT_PASSWORD
         IF (servermsg.data)
@@ -2429,6 +2463,12 @@ PROC readMayGetChar(msgport, checkTelnet, whereto)
             userLineLen:=((userLineLen AND $ff00) OR temp)-1
             IF userLineLen<10 THEN userLineLen:=10
           ENDIF
+          ->keep the raw reported WIDTH (cols, nawsMode 4+3) and HEIGHT (rows,
+          ->nawsMode 2+1) so numberOfLinesTest / the logon door can use them.
+          IF nawsMode=4 THEN nawsCols:=Shl(temp,8)
+          IF nawsMode=3 THEN nawsCols:=(nawsCols AND $ff00) OR temp
+          IF nawsMode=2 THEN nawsRows:=Shl(temp,8)
+          IF nawsMode=1 THEN nawsRows:=(nawsRows AND $ff00) OR temp
           nawsMode--
         ELSEIF (temp=255)
           lastIAC:=5
@@ -3519,7 +3559,11 @@ PROC processXimMsg(msgcmd,msg:PTR TO jhMessage,tooltype,command,privcmd,params,n
       IF (msg.data)
         AstrCopy(msg.string,loggedOnUser.name,31)
       ELSE
-        AstrCopy(loggedOnUser.name,msg.string,31)
+        /* Never let a door blank the user name. A door that intends a
+        ** read (data=1) but whose data field is mis-set arrives here with
+        ** an empty string; writing it would erase the name and the logoff
+        ** repair then refills it from the uppercase keys lookup. */
+        IF StrLen(msg.string)>0 THEN AstrCopy(loggedOnUser.name,msg.string,31)
       ENDIF
     CASE DT_PASSWORD
       IF (msg.data)
@@ -4057,6 +4101,14 @@ PROC processXimMsg(msgcmd,msg:PTR TO jhMessage,tooltype,command,privcmd,params,n
         StrCopy(tempstring,loggedOnUserMisc.pwdHash,32)
       ENDIF
       AstrCopy(msg.string,tempstring,40)
+    CASE CHECK_PASSWORD
+      /* msg.string = candidate password; reply '1' if it matches the
+      ** logged-on user's password, else '0'.  Side-effect free. */
+      IF (loggedOnUser<>NIL) AND (verifyPasswordNoLock(loggedOnUser,loggedOnUserMisc,msg.string))
+        AstrCopy(msg.string,'1')
+      ELSE
+        AstrCopy(msg.string,'0')
+      ENDIF
     CASE GET_GNSFLAG
       msg.data:=IF(nonStopDisplayFlag) THEN 1  ELSE 0
     CASE DISPLAY_FILE
@@ -4582,7 +4634,7 @@ PROC doorMsgLoadAccount(doorMsg: PTR TO jhMessage)
     saveMsgPointers(currentConf,currentMsgBase) ->AddMsgPointers();
     IF tuserdata<>NIL THEN CopyMem(loggedOnUser,tuserdata,SIZEOF user);
     IF tuserkeys<>NIL THEN CopyMem(loggedOnUserKeys,tuserkeys,SIZEOF userKeys)
-    IF tusermisc<>NIL THEN CopyMem(loggedOnUserKeys,tusermisc,SIZEOF userMisc)
+    IF tusermisc<>NIL THEN CopyMem(loggedOnUserMisc,tusermisc,SIZEOF userMisc)
     loadMsgPointers(currentConf,currentMsgBase)
     doorMsg.nodeID:=1;
   ELSE
@@ -8007,6 +8059,27 @@ PROC processInputMessage(timeout, extsig = 0,rawMode=FALSE, allowSer=TRUE)
   ENDIF
 ENDPROC wasControl, ch
 
+PROC repairAccountName(userPtr: PTR TO user, userKeysPtr: PTR TO userKeys)
+  IF userPtr=NIL THEN RETURN
+
+  IF StrLen(userPtr.name)=0
+    IF userKeysPtr<>NIL
+      IF StrLen(userKeysPtr.userName)>0
+        AstrCopy(userPtr.name,userKeysPtr.userName,31)
+      ENDIF
+    ENDIF
+  ENDIF
+
+  IF userKeysPtr<>NIL
+    IF StrLen(userKeysPtr.userName)=0
+      IF StrLen(userPtr.name)>0
+        AstrCopy(userKeysPtr.userName,userPtr.name,31)
+        UpperStr(userKeysPtr.userName)
+      ENDIF
+    ENDIF
+  ENDIF
+ENDPROC
+
 PROC loadAccount(slot,userPtr:PTR TO user, userKeysPtr:PTR TO userKeys, userMiscPtr:PTR TO userMisc)
   DEF l,fh
   DEF result
@@ -8043,6 +8116,10 @@ PROC loadAccount(slot,userPtr:PTR TO user, userKeysPtr:PTR TO userKeys, userMisc
     ENDIF
   ENDIF
 
+  IF (result=RESULT_SUCCESS) AND userPtr AND userKeysPtr
+    repairAccountName(userPtr,userKeysPtr)
+  ENDIF
+
   IF (result=RESULT_SUCCESS) AND userPtr AND userKeysPtr AND userMiscPtr
 
     ->populate bcd download and upload bytes if not already done
@@ -8056,7 +8133,7 @@ ENDPROC result
 
 /* if flg > 0 then force save account */
 PROC saveAccount(hoozer: PTR TO user, hoozer2: PTR TO userKeys, hoozer3: PTR TO userMisc,uslot,flg) HANDLE
-  DEF slot,stat
+  DEF slot,stat,repaired
   DEF fh=NIL,l
   DEF tempStr[255]:STRING
 
@@ -8071,6 +8148,24 @@ PROC saveAccount(hoozer: PTR TO user, hoozer2: PTR TO userKeys, hoozer3: PTR TO 
   ELSE
     IF(hoozer.slotNumber=0) THEN RETURN RESULT_FAILURE
     slot:=hoozer.slotNumber-1
+  ENDIF
+
+  repaired:=FALSE
+  IF StrLen(hoozer.name)=0
+    repairAccountName(hoozer,hoozer2)
+    IF StrLen(hoozer.name)>0 THEN repaired:=TRUE
+  ENDIF
+
+  IF StrLen(hoozer.name)=0
+    StringF(tempStr,'Refusing to save account slot \d with blank user name',slot+1)
+    debugLog(LOG_ERROR,tempStr)
+    RETURN RESULT_FAILURE
+  ENDIF
+
+  repairAccountName(hoozer,hoozer2)
+  IF repaired
+    StringF(tempStr,'Repaired blank account name for slot \d from user key \s',slot+1,hoozer.name)
+    debugLog(LOG_ERROR,tempStr)
   ENDIF
 
   l:=SIZEOF user
@@ -8217,14 +8312,31 @@ PROC processLoggingOff()
     writeLogoffLog('logging off 8',FALSE)
     IF(quickFlag=FALSE)
       checkScreenClear()
-      IF(logonType<>LOGON_TYPE_SYSOP) AND (ftpConn=FALSE) THEN displayScreen(SCREEN_LOGOFF)
+      IF(logonType<>LOGON_TYPE_SYSOP) AND (ftpConn=FALSE)
+        IF readToolType(TOOLTYPE_NODE,node,'LOGOFF_TEXT',tempstr)
+          IF StrLen(tempstr)>0
+            aePuts('\b\n')
+            processMci(tempstr)
+            aePuts('\b\n')
+          ENDIF
+        ENDIF
+        displayScreen(SCREEN_LOGOFF)
+      ENDIF
     ENDIF
 
     writeLogoffLog('logging off 9',FALSE)
     IF(logonType<>LOGON_TYPE_SYSOP) AND (ftpConn=FALSE) THEN aePuts('\b\nClick...')
 
-    AstrCopy(loggedOnUserKeys.userName,loggedOnUser.name,31)
-    UpperStr(loggedOnUserKeys.userName)
+    IF StrLen(loggedOnUser.name)=0
+      IF StrLen(loggedOnUserKeys.userName)>0
+        AstrCopy(loggedOnUser.name,loggedOnUserKeys.userName,31)
+      ENDIF
+    ENDIF
+
+    IF StrLen(loggedOnUser.name)>0
+      AstrCopy(loggedOnUserKeys.userName,loggedOnUser.name,31)
+      UpperStr(loggedOnUserKeys.userName)
+    ENDIF
     loggedOnUserKeys.number:=loggedOnUser.slotNumber
 
     IF(newSinceFlag) THEN loggedOnUser.newSinceDate:=getSystemTime()
@@ -11332,13 +11444,19 @@ ENDPROC
 
 PROC numberOfLinesTest()
   DEF stat
-  DEF str[20]:STRING
+  DEF str[100]:STRING    ->holds the (now longer) detected-size prompt too
 
   FOR stat:=70 TO 2 STEP -1
     StringF(str,' \d\b\n',stat)
     aePuts(str)
   ENDFOR
-  aePuts('\b\nEnter the number you see at the top of your screen (or 0 for Auto): ')
+  ->keep the original prompt; only append the NAWS-detected size when known.
+  IF nawsRows>0
+    StringF(str,'\b\nEnter the number you see at the top of your screen (or 0 for Auto) [\d detected]: ',nawsRows)
+    aePuts(str)
+  ELSE
+    aePuts('\b\nEnter the number you see at the top of your screen (or 0 for Auto): ')
+  ENDIF
   stat:=lineInput('','',3,INPUT_TIMEOUT,str)
   IF(stat<0) THEN RETURN stat
   IF(StrLen(str)=0) THEN RETURN RESULT_SUCCESS
@@ -13603,6 +13721,7 @@ ENDPROC
 PROC updateTitle(hoozer: PTR TO user)
   DEF aflag,pflag,pub=FALSE
   DEF pubScreen[20]:STRING
+  DEF displayName[31]:STRING
 
   IF pagedFlag THEN pflag:="*" ELSE pflag:=" "
   IF sysopAvail THEN aflag:="*" ELSE aflag:=" "
@@ -13620,7 +13739,17 @@ PROC updateTitle(hoozer: PTR TO user)
   ENDIF
 
   IF(scropen)
-    StringF(ititlebar,'   \c\s, \s, (\d \l\s[10] [\d]) \d mins, \d \c',pflag,hoozer.name,hoozer.phoneNumber,hoozer.secStatus,hoozer.conferenceAccess,currentConf,Div(timeLimit,60),onlineBaud,aflag) ->//(RTS) was Online_BaudR
+    StrCopy(displayName,'')
+    IF StrLen(hoozer.name)>0
+      AstrCopy(displayName,hoozer.name,31)
+    ELSEIF hoozer=loggedOnUser
+      IF loggedOnUserKeys<>NIL
+        IF StrLen(loggedOnUserKeys.userName)>0
+          AstrCopy(displayName,loggedOnUserKeys.userName,31)
+        ENDIF
+      ENDIF
+    ENDIF
+    StringF(ititlebar,'   \c\s, \s, (\d \l\s[10] [\d]) \d mins, \d \c',pflag,displayName,hoozer.phoneNumber,hoozer.secStatus,hoozer.conferenceAccess,currentConf,Div(timeLimit,60),onlineBaud,aflag) ->//(RTS) was Online_BaudR
     IF(dStatBar=NIL)
       SetWindowTitles(window,ititlebar,ititlebar)
       IF (windowStat<>NIL) AND (pub) THEN SetWindowTitles(windowStat,ititlebar,ititlebar)
@@ -21253,10 +21382,13 @@ PROC editInfo(which:LONG, hoozer:PTR TO user, hoozer2:PTR TO userKeys, hoozer3: 
   DEF changes=FALSE
 
   nofkeys:=1
+  repairAccountName(hoozer,hoozer2)
+  IF StrLen(hoozer.name)>0
+    StrCopy(tempStr,hoozer.name)
+    UpperStr(tempStr)
+    AstrCopy(hoozer2.userName,tempStr,31)
+  ENDIF
   displayAccount(which,page,hoozer,hoozer2,hoozer3,f6)
-  StrCopy(tempStr,hoozer.name)
-  UpperStr(tempStr)
-  AstrCopy(hoozer2.userName,tempStr,31)
 
   checkLock:=checkLockAccounts(f6)
   REPEAT
@@ -21418,10 +21550,12 @@ PROC editInfo(which:LONG, hoozer:PTR TO user, hoozer2:PTR TO userKeys, hoozer3: 
             aePuts('[2;10H')
             StrCopy(tempStr,hoozer.name)
             lineInput('',tempStr,30,INPUT_TIMEOUT,tempStr)
-            AstrCopy(hoozer.name,tempStr,31)
-            UpperStr(tempStr)
-            AstrCopy(hoozer2.userName,tempStr,31)
-            changes:=TRUE
+            IF StrLen(tempStr)>0
+              AstrCopy(hoozer.name,tempStr,31)
+              UpperStr(tempStr)
+              AstrCopy(hoozer2.userName,tempStr,31)
+              changes:=TRUE
+            ENDIF
             flag:=0
           CASE "B"             /* Real Name */
             aePuts('[2;56H')
@@ -21651,10 +21785,12 @@ PROC editInfo(which:LONG, hoozer:PTR TO user, hoozer2:PTR TO userKeys, hoozer3: 
             aePuts('[2;10H')
             StrCopy(tempStr,hoozer.name)
             lineInput('',tempStr,30,INPUT_TIMEOUT,tempStr)
-            AstrCopy(hoozer.name,tempStr,31)
-            UpperStr(tempStr)
-            AstrCopy(hoozer2.userName,tempStr,31)
-            changes:=TRUE
+            IF StrLen(tempStr)>0
+              AstrCopy(hoozer.name,tempStr,31)
+              UpperStr(tempStr)
+              AstrCopy(hoozer2.userName,tempStr,31)
+              changes:=TRUE
+            ENDIF
             flag:=0
           CASE "B"             /* Password reset */
             aePuts('[3;21H   [3;21H')
@@ -29487,6 +29623,190 @@ PROC handleIemsi()
   DisposeLink(tempStr)
 ENDPROC
 
+PROC runLogonDoor(userNameOut)
+  DEF commandfile[255]:STRING
+  DEF portName[12]:STRING
+  DEF mp:PTR TO mp
+  DEF ximSig,signals
+  DEF msg:PTR TO jhMessage
+  DEF msgcmd,action
+  DEF exit,result
+  DEF attempts
+  DEF uname[28]:STRING
+  DEF pass[50]:STRING
+  DEF envName[32]:STRING
+  DEF envBuf[8]:STRING
+  DEF exestring[255]:STRING
+  DEF tempstring[255]:STRING
+  DEF ch
+
+  getNodeFile(TOOLTYPE_SYSCMD,'LOGON',commandfile)
+  IF configFileExists(commandfile)=FALSE THEN RETURN 0
+
+  readToolType(TOOLTYPE_SYSCMD,'LOGON','LOCATION',commandfile)
+  IF StrLen(commandfile)=0 THEN RETURN 0
+
+  result:=3     /* default = LOGON_DOOR_QUIT */
+  attempts:=0
+
+  StringF(envName,'LOGON_ATTEMPT_\d',node)
+  SetVar(envName,'0',-1,LV_VAR OR GVF_GLOBAL_ONLY)
+  StringF(envName,'LOGON_REASON_\d',node)
+  SetVar(envName,'',-1,LV_VAR OR GVF_GLOBAL_ONLY)
+
+  StringF(portName,'AEDoorPort\d',node)
+  mp:=createPort(portName,0)
+  IF mp=NIL THEN RETURN 0
+  ximSig:=Shl(1,mp.sigbit)
+
+  StringF(exestring,'\s \d',commandfile,node)
+  IF startProcess(exestring,50000,0,TRUE,FALSE)=-1
+    deletePort(mp)
+    RETURN 0
+  ENDIF
+
+  exit:=FALSE
+  WHILE exit=FALSE
+    signals:=Wait(ximSig)
+    WHILE (msg:=GetMsg(mp))
+      msgcmd:=msg.command
+      SELECT msgcmd
+        CASE JH_REGISTER
+          msg.command:=29
+        CASE JH_WRITE
+          IF doorSilent=FALSE THEN aePuts(msg.string)
+        CASE JH_SM
+          aePuts(msg.string)
+          IF msg.data THEN aePuts('\b\n')
+        CASE JH_PM
+          IF lineInput(msg.string,'',msg.data,doorTimeout,tempstring)<>RESULT_SUCCESS
+            msg.data:=-1
+          ELSE
+            msg.data:=1
+            AstrCopy(msg.string,tempstring,200)
+          ENDIF
+        CASE JH_LI
+          IF msg.data>=$8000
+            msg.data:=msg.data-$8000
+          ENDIF
+          IF lineInput('',msg.string,msg.data,doorTimeout,tempstring,FALSE)<>RESULT_SUCCESS
+            msg.data:=-1
+          ELSE
+            msg.data:=1
+            AstrCopy(msg.string,tempstring,200)
+          ENDIF
+        CASE JH_HK
+          aePuts(msg.string)
+          ch:=readChar(doorTimeout)
+          IF ch<0 THEN msg.data:=-1 ELSE msg.data:=1
+          msg.string[0]:=ch
+          msg.string[1]:=0
+          msg.command:=ximPort
+        CASE JH_20
+          ch:=readChar(doorTimeout)
+          msg.data:=ch
+          msg.command:=ximPort
+        CASE GETKEY
+          /* Non-blocking key poll for the logon door (mirrors the
+          ** in-session handler in processXimMsg). Lets a pre-login door
+          ** animate its prompt and only block on HotKey once a key is
+          ** actually waiting. checkInput() only peeks, so the following
+          ** HotKey still consumes the character. */
+          IF checkInput() THEN msg.string[0]:="1" ELSE msg.string[0]:="0"
+          msg.string[1]:=0
+        CASE ACP_LOGON_GETSIZE
+          /* Tell the pre-login door the terminal size as "cols;rows".
+          ** Local/sysop console -> derive from the window (8px Topaz cell);
+          ** remote -> telnet NAWS if the client reported it. "0;0" means
+          ** unknown, so the door falls back to its own CPR probe (which
+          ** works remotely but NOT on the local console). */
+          IF (logonType<LOGON_TYPE_REMOTE) AND (window<>NIL)
+            StringF(tempstring,'\d;\d',Shr(window.width,3),Shr(window.height,3))
+          ELSEIF nawsCols>0
+            StringF(tempstring,'\d;\d',nawsCols,nawsRows)
+          ELSE
+            StrCopy(tempstring,'0;0')
+          ENDIF
+          AstrCopy(msg.string,tempstring,200)
+        CASE ACP_LOGON_SUBMIT
+          action:=msg.data
+          IF action=ACP_LOGON_ACTION_SUBMIT
+            AstrCopy(uname,msg.string,28)
+            AstrCopy(pass,msg.string+28,50)
+            IF chooseAName(uname,tempUser,tempUserKeys,tempUserMisc,0)=RESULT_FAILURE
+              msg.data:=-1
+              attempts++
+              StringF(envName,'LOGON_ATTEMPT_\d',node)
+              StringF(envBuf,'\d',attempts)
+              SetVar(envName,envBuf,-1,LV_VAR OR GVF_GLOBAL_ONLY)
+              StringF(envName,'LOGON_REASON_\d',node)
+              SetVar(envName,'NO_USER',-1,LV_VAR OR GVF_GLOBAL_ONLY)
+            ELSEIF verifyPasswordNoLock(tempUser,tempUserMisc,pass)
+              /* Return the name exactly as typed, mirroring the normal
+              ** prompt path; loadAccount supplies the stored proper-case
+              ** name and only falls back to this if the record is blank.
+              ** Never return the uppercase keys lookup name here. */
+              AstrCopy(userNameOut,uname,28)
+              msg.data:=1
+              result:=1
+            ELSE
+              msg.data:=-2
+              attempts++
+              StringF(envName,'LOGON_ATTEMPT_\d',node)
+              StringF(envBuf,'\d',attempts)
+              SetVar(envName,envBuf,-1,LV_VAR OR GVF_GLOBAL_ONLY)
+              StringF(envName,'LOGON_REASON_\d',node)
+              SetVar(envName,'BAD_PASS',-1,LV_VAR OR GVF_GLOBAL_ONLY)
+            ENDIF
+          ELSEIF action=ACP_LOGON_ACTION_NEWUSER
+            IF StrLen(msg.string)=0
+              result:=0
+              msg.data:=-1
+            ELSE
+              AstrCopy(userNameOut,msg.string,28)
+              result:=2
+              msg.data:=1
+            ENDIF
+          ELSEIF action=ACP_LOGON_ACTION_QUIT
+            result:=3
+            msg.data:=1
+          ELSEIF action=ACP_LOGON_ACTION_CHECK
+            /* pre-login door: does this username exist? (no password check) */
+            AstrCopy(uname,msg.string,28)
+            IF chooseAName(uname,tempUser,tempUserKeys,tempUserMisc,0)=RESULT_FAILURE
+              msg.data:=-1
+            ELSE
+              msg.data:=1
+            ENDIF
+          ELSEIF action=ACP_LOGON_ACTION_LOCALLOGIN
+            /* LOCALSECURITY=OFF: accept a known user without a password, but
+            ** ONLY for a genuinely local session (sysop/local console). The
+            ** door cannot spoof this; we re-check logonType here. Remote
+            ** sessions get -2 so the door falls back to the password prompt. */
+            AstrCopy(uname,msg.string,28)
+            IF (logonType<LOGON_TYPE_REMOTE) AND (chooseAName(uname,tempUser,tempUserKeys,tempUserMisc,0)<>RESULT_FAILURE)
+              AstrCopy(userNameOut,uname,28)
+              msg.data:=1
+              result:=1
+            ELSE
+              msg.data:=-2
+            ENDIF
+          ELSEIF action=ACP_LOGON_ACTION_COMMENT
+            /* ALLOWCOMMENT=ON: store a comment left after a failed logon. */
+            StringF(tempstring,'\t** Logon comment: \s',msg.string)
+            callersLog(tempstring)
+            msg.data:=1
+          ENDIF
+        CASE JH_SHUTDOWN
+          exit:=TRUE
+      ENDSELECT
+      ReplyMsg(msg)
+    ENDWHILE
+  ENDWHILE
+
+  deletePort(mp)
+ENDPROC result
+
 PROC processLogon()
   DEF tempStr[255]:STRING
   DEF tempStr2[255]:STRING
@@ -29498,6 +29818,8 @@ PROC processLogon()
   DEF userNum
   DEF stat,ch
   DEF hrs,calcHrs,autovalPreset,pwdExpiryDays
+  DEF doorUser[28]:STRING
+  DEF doorResult,doorValidated
 
   ripMode:=FALSE
   confNameType:=NAME_TYPE_USERNAME
@@ -29594,10 +29916,35 @@ PROC processLogon()
   retryCount:=0
   userFound:=FALSE
   newUser:=FALSE
+  doorValidated:=FALSE
 
   updateCallerNum()
 
   validUser:=2
+
+  StrCopy(doorUser,'')
+  doorResult:=runLogonDoor(doorUser)
+  SELECT doorResult
+    CASE 1
+      IF StrLen(doorUser)=0
+        JUMP logonLoop
+      ENDIF
+      IF chooseAName(doorUser,tempUser,tempUserKeys,tempUserMisc,0)=RESULT_FAILURE
+        JUMP logonLoop
+      ENDIF
+      AstrCopy(userName,doorUser,28)
+      userNum:=tempUser.slotNumber
+      userFound:=TRUE
+      doorValidated:=TRUE
+      JUMP afterLogonLoop
+    CASE 2
+      AstrCopy(userName,doorUser,28)
+      newUser:=TRUE
+      JUMP afterLogonLoop
+    CASE 3
+      state:=STATE_LOGGING_OFF
+      RETURN
+  ENDSELECT
 
 logonLoop:
   REPEAT
@@ -29664,6 +30011,8 @@ logonLoop:
 
   UNTIL (userFound) OR (newUser) OR (retryCount=5)
 
+afterLogonLoop:
+
   IF retryCount=5
     aePuts('\b\nToo Many Errors, Goodbye!\b\n')
     Delay(50)
@@ -29678,6 +30027,9 @@ logonLoop:
   ENDIF
 
   IF newUser
+    IF StrLen(userName)=0
+      JUMP logonLoop
+    ENDIF
     IF newUserAccount(userName)<>RESULT_SUCCESS
       END loggedOnUser
       END loggedOnUserKeys
@@ -29703,6 +30055,19 @@ logonLoop:
       aePuts('That account has problems\b\n')
       retryCount++
       JUMP logonLoop
+    ENDIF
+
+    IF StrLen(loggedOnUser.name)=0
+      IF StrLen(userName)>0
+        AstrCopy(loggedOnUser.name,userName,31)
+      ELSEIF StrLen(loggedOnUserKeys.userName)>0
+        AstrCopy(loggedOnUser.name,loggedOnUserKeys.userName,31)
+      ENDIF
+    ENDIF
+
+    IF (StrLen(loggedOnUserKeys.userName)=0) AND (StrLen(loggedOnUser.name)>0)
+      AstrCopy(loggedOnUserKeys.userName,loggedOnUser.name,31)
+      UpperStr(loggedOnUserKeys.userName)
     ENDIF
   ENDIF
 
@@ -29732,6 +30097,7 @@ logonLoop:
     
   setEnvStat(ENV_LOGGINGON)
   sendQuietFlag(quietFlag)
+  statPrintUser(loggedOnUser,loggedOnUserKeys,loggedOnUserMisc)
 
   IF(loggedOnUser.slotNumber=0)
     aePuts('That account has been deleted.\b\n')
@@ -29762,7 +30128,7 @@ logonLoop:
     RETURN
   ENDIF
 
-  IF newUser=FALSE
+  IF (newUser=FALSE) AND (doorValidated=FALSE)
     IF logonType>=LOGON_TYPE_REMOTE
       stat:=checkPassword()
       IF stat<>RESULT_SUCCESS
@@ -29889,6 +30255,14 @@ logonLoop:
   ENDIF
 
   processOlmMessageQueue(FALSE)
+
+  IF readToolType(TOOLTYPE_NODE,node,'LOGON_GREETING',tempStr)
+    IF StrLen(tempStr)>0
+      aePuts('\b\n')
+      processMci(tempStr)
+      aePuts('\b\n')
+    ENDIF
+  ENDIF
 
   state:=STATE_LOGGEDON
   stateData:=0
