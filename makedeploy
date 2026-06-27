@@ -1,0 +1,48 @@
+; Build and deploy AmiExpress development binaries to the live BBS.
+; Required assigns:
+;   aeDev:  AmiExpress source tree
+;   BBS:    live AmiExpress installation
+;   DOORS:  door source/install tree
+
+failat 20
+
+echo "make and deploy amiexpress develop"
+
+; build axSetupTool first, because it has its own makefile
+cd aeDev:axSetupTool
+make
+
+; deploy setup tool to live BBS utils
+copy axSetupTool BBS:Utils/axSetupTool
+
+; build AmiExpress, ACP and utilities
+cd aeDev:
+make
+
+; deploy node/controller binaries
+copy express5 BBS:express5
+copy ACP BBS:acp
+
+; deploy utilities built by the main makefile
+copy jsonImport BBS:Utils/jsonImport
+copy icon2cfg BBS:Utils/icon2cfg
+copy axIconSync BBS:Utils/axIconSync
+copy axIconSyncGUI BBS:Utils/axIconSyncGUI
+copy qwk BBS:Utils/qwk
+copy ftn BBS:Utils/ftn
+
+; build and deploy the pre-login door
+cd axDev:LogonDoor
+EVO LOGON DEBUG IGNORECACHE NILCHECK SYM SHOWFNAME
+copy LOGON BBS:Doors/LogonDoor/LOGON
+; NOTE: the .info icons (BBS:Commands/SysCmd/LOGON.info and
+; BBS:Doors/LogonDoor/LOGON.info) are hand-maintained/valid - do NOT overwrite
+; them here. The door icon selects a look via DESIGN=<name>.
+; per-design presets: config + [CONFIG_END] + embedded screen backdrop
+; (DESIGN=<name> -> layout/<name>.design)
+makedir BBS:Doors/LogonDoor/layout
+copy layout BBS:Doors/LogonDoor/layout all
+
+cd aeDev:
+
+echo "deploy complete"
