@@ -255,6 +255,15 @@ EXPORT CONST MEMCONF=612
 EXPORT CONST SET_SERSHARED=613
 EXPORT CONST CONF_ACCESS=614
 EXPORT CONST PASSWORD_HASH=615
+EXPORT CONST CHECK_PASSWORD=650   /* door: verify logged-on user's password (returns '1'/'0'), no lock side-effects */
+EXPORT CONST ACP_LOGON_SUBMIT=651 /* pre-login door: submit username+password for validation; reply data=1(ok)/-1(no user)/-2(bad pwd) */
+EXPORT CONST ACP_LOGON_ACTION_SUBMIT=10
+EXPORT CONST ACP_LOGON_ACTION_NEWUSER=11
+EXPORT CONST ACP_LOGON_ACTION_QUIT=12
+EXPORT CONST ACP_LOGON_ACTION_CHECK=13 /* pre-login door: check username exists; reply data=1(exists)/-1(unknown) */
+EXPORT CONST ACP_LOGON_ACTION_LOCALLOGIN=14 /* pre-login door (LOCALSECURITY=OFF): accept known user w/o password, BBS verifies the session is local; reply data=1(ok)/-2(not local -> ask password) */
+EXPORT CONST ACP_LOGON_ACTION_COMMENT=15 /* pre-login door (ALLOWCOMMENT=ON): store a comment to the sysop in the callers log; reply data=1 */
+EXPORT CONST ACP_LOGON_GETSIZE=652 /* pre-login door: query terminal size; reply string "cols;rows" ("0;0"=unknown -> door probes itself via CPR). Local console -> window size; remote -> telnet NAWS if known */
 EXPORT CONST GET_GNSFLAG=616
 EXPORT CONST DISPLAY_FILE=617
 EXPORT CONST CHECK_TO_DISPLAY=618
@@ -600,4 +609,3 @@ EXPORT OBJECT singlePort
   misc2[100]:ARRAY OF CHAR
   baud[10]:ARRAY OF CHAR
 ENDOBJECT
-
